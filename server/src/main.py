@@ -1,0 +1,359 @@
+import asyncio
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from .validate import validate_download_input, normalize_url
+
+app = FastAPI(title="avali")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+RATE_LIMIT: dict[str, list[float]] = {}
+RATE_WINDOW = 5.0
+RATE_MAX = 5
+
+GB = 1024 ** 3
+RAM_HEADROOM = 3 * GB
+TMPFS_MAX_FILE = 2 * GB
+
+
+def rate_limit(ip: str) -> None:
+    now = time.time()
+    timestamps = RATE_LIMIT.get(ip, [])
+    timestamps = [t for t in timestamps if now - t < RATE_WINDOW]
+    if len(timestamps) >= RATE_MAX:
+        raise HTTPException(status_code=429, detail="slow down a little!!!")
+    timestamps.append(now)
+    RATE_LIMIT[ip] = timestamps
+
+
+class DownloadRequest(BaseModel):
+    url: str
+    format: str = "video+audio"
+    quality: int | None = None
+    container: str = "mp4"
+
+
+def sanitize_filename(name: str) -> str:
+    return re.sub(r'[^\w\s.-]', "", name).strip() or "video"
+
+
+def get_video_title(target_url: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--no-playlist", "--print", "title", target_url],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def get_available_ram() -> int | None:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return None
+
+
+def get_selector_only(fmt_args: list[str]) -> list[str]:
+    if "-f" in fmt_args:
+        idx = fmt_args.index("-f")
+        return ["-f", fmt_args[idx + 1]]
+    return []
+
+
+def estimate_size(target_url: str, selector_args: list[str]) -> int | None:
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--no-playlist", *selector_args, "--dump-json", "--no-warnings",
+             target_url],
+            capture_output=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout)
+    except Exception:
+        return None
+
+    requested = data.get("requested_formats")
+    if requested:
+        total = 0
+        for f in requested:
+            total += f.get("filesize") or f.get("filesize_approx") or 0
+        return total or None
+    return data.get("filesize") or data.get("filesize_approx") or None
+
+
+VIDEO_MIME = {
+    "mp4": "video/mp4",
+    "webm": "video/webm",
+    "mkv": "video/x-matroska",
+}
+AUDIO_MIME = {
+    "mp4": "audio/mp4",
+    "mp3": "audio/mpeg",
+    "wav": "audio/wav",
+    "flac": "audio/flac",
+}
+
+
+def get_format_args(fmt: str, quality: int | None = None, container: str = "mp4") -> list[str]:
+    if fmt == "audio":
+        if container in ("mp3", "wav", "flac"):
+            return ["-f", "bestaudio", "--extract-audio", "--audio-format", container]
+        return ["-f", "bestaudio[ext=m4a]/bestaudio", "--merge-output-format", "mp4"]
+
+    if fmt == "video+audio":
+        if container == "mkv":
+            if quality:
+                return ["-f", f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best", "--merge-output-format", "mkv"]
+            return ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mkv"]
+        if container == "webm":
+            if quality:
+                return ["-f", f"bestvideo[height<={quality}][ext=webm]+bestaudio[ext=webm]/bestvideo[height<={quality}]+bestaudio/best", "--merge-output-format", "webm"]
+            return ["-f", "bestvideo[ext=webm]+bestaudio[ext=webm]/bestvideo+bestaudio/best", "--merge-output-format", "webm"]
+        if quality:
+            return ["-f", f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best", "--merge-output-format", "mp4"]
+        return ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
+
+    if fmt == "video":
+        vext = container if container in ("mp4", "webm", "mkv") else "mp4"
+        if quality:
+            return ["-f", f"bestvideo[height<={quality}][ext={vext}]/bestvideo[height<={quality}]/best"]
+        return ["-f", f"bestvideo[ext={vext}]/bestvideo/best"]
+
+    return ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/api/qualities")
+async def get_qualities(url: str, request: Request):
+    ip = request.client.host if request.client else "unknown"
+    rate_limit(ip)
+
+    err = validate_download_input(url, "video+audio")
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+
+    target_url = normalize_url(url)
+    loop = asyncio.get_running_loop()
+
+    def run():
+        proc = subprocess.Popen(
+            ["yt-dlp", "--no-playlist", "--dump-json", "--no-warnings", target_url],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise TimeoutError("yt-dlp timed out")
+        return proc.returncode, stdout, stderr
+
+    try:
+        returncode, stdout, stderr = await loop.run_in_executor(None, run)
+    except TimeoutError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if returncode != 0:
+        err_text = stderr.decode("utf-8", errors="replace").strip()
+        raise HTTPException(status_code=500, detail=err_text or "failed to fetch formats")
+
+    data = json.loads(stdout)
+    formats = data.get("formats", [])
+
+    heights = sorted(set(
+        f["height"] for f in formats
+        if f.get("vcodec") and f["vcodec"] != "none" and f.get("height")
+    ), reverse=True)
+
+    if not heights:
+        raise HTTPException(status_code=500, detail="no video formats found")
+
+    return {"qualities": heights}
+
+
+@app.post("/api/metadata")
+async def get_metadata(req: DownloadRequest, request: Request):
+    ip = request.client.host if request.client else "unknown"
+    rate_limit(ip)
+
+    err = validate_download_input(req.url, req.format)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+
+    target_url = normalize_url(req.url)
+    fmt = req.format
+    fmt_args = get_format_args(fmt, req.quality, req.container)
+    selector_args = get_selector_only(fmt_args)
+
+    loop = asyncio.get_running_loop()
+
+    def run():
+        proc = subprocess.Popen(
+            ["yt-dlp", "--no-playlist", *selector_args, "--dump-json", "--no-warnings",
+             target_url],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise TimeoutError("yt-dlp timed out")
+        return proc.returncode, stdout, stderr
+
+    try:
+        returncode, stdout, stderr = await loop.run_in_executor(None, run)
+    except TimeoutError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if returncode != 0:
+        err_text = stderr.decode("utf-8", errors="replace").strip()
+        raise HTTPException(status_code=500, detail=err_text or "failed to get metadata")
+
+    data = json.loads(stdout)
+
+    total_size = 0
+    requested = data.get("requested_formats")
+    if requested:
+        for f in requested:
+            size = f.get("filesize") or f.get("filesize_approx") or 0
+            total_size += size
+    else:
+        total_size = data.get("filesize") or data.get("filesize_approx") or 0
+
+    title = data.get("title", "") or ""
+
+    return {
+        "size": total_size if total_size > 0 else None,
+        "title": title,
+    }
+
+
+@app.post("/api/download")
+async def download(req: DownloadRequest, request: Request):
+    ip = request.client.host if request.client else "unknown"
+    rate_limit(ip)
+
+    err = validate_download_input(req.url, req.format)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+
+    target_url = normalize_url(req.url)
+    fmt = req.format
+    fmt_args = get_format_args(fmt, req.quality, req.container)
+    selector_args = get_selector_only(fmt_args)
+
+    title = get_video_title(target_url)
+    safe_name = sanitize_filename(title or "video")
+
+    container = req.container
+    if fmt == "audio":
+        mime = AUDIO_MIME.get(container, "audio/mp4")
+    else:
+        mime = VIDEO_MIME.get(container, "video/mp4")
+
+    loop = asyncio.get_running_loop()
+
+    size_est = await loop.run_in_executor(None, estimate_size, target_url, selector_args)
+    ram = await loop.run_in_executor(None, get_available_ram)
+
+    use_tmpfs = (
+        size_est is not None
+        and size_est < TMPFS_MAX_FILE
+        and ram is not None
+        and ram - size_est >= RAM_HEADROOM
+    )
+
+    base_dir = "/dev/shm" if use_tmpfs else None
+    tmpdir = tempfile.mkdtemp(prefix="avali-", dir=base_dir)
+    outtmpl = os.path.join(tmpdir, "out.%(ext)s")
+
+    def run():
+        proc = subprocess.Popen(
+            ["yt-dlp", "--no-playlist", *fmt_args, "-o", outtmpl, "--no-warnings", "--quiet",
+             target_url],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        try:
+            _, stderr = proc.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise TimeoutError("yt-dlp timed out")
+        return proc.returncode, stderr
+
+    try:
+        returncode, stderr = await loop.run_in_executor(None, run)
+    except TimeoutError as e:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if returncode != 0:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        err_text = stderr.decode("utf-8", errors="replace").strip()
+        raise HTTPException(status_code=500, detail=err_text or "download failed")
+
+    files = glob.glob(os.path.join(tmpdir, "out.*"))
+    if not files:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail="no output file")
+
+    filepath = files[0]
+    real_ext = os.path.splitext(filepath)[1].lstrip(".") or container
+    size = os.path.getsize(filepath)
+
+    async def stream():
+        try:
+            with open(filepath, "rb") as f:
+                while True:
+                    chunk = await loop.run_in_executor(None, f.read, 65536)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return StreamingResponse(
+        stream(),
+        media_type=mime,
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_name}.{real_ext}"',
+            "X-Content-Type-Options": "nosniff",
+            "Content-Length": str(size),
+        },
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("src.main:app", host="0.0.0.0", port=8000, reload=True)
