@@ -15,7 +15,7 @@ avali is a *completely free* youtube downloader with no bullshit. just paste the
 yes! see below
 
 # special thanks
-special thanks to liquidsquid1 for letting me use an early version of his zinc ui lib! <3
+special thanks to liquidsquid1 for letting me use an early version of her zinc ui lib! <3
 
 thanks to cobalt.tools, without them i probably wouldn't have made this!
 
